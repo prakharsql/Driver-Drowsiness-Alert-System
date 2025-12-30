@@ -34,4 +34,3 @@ The system monitors the driver’s eye state using facial landmarks and triggers
 
 ---
 
-## 📂 Project Structure
