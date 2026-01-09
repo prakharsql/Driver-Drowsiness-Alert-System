@@ -3,40 +3,115 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import time
+from ultralytics import YOLO
+import os
+import sys
 import winsound
 import threading
+
+# ================= FIX IMPORT PATH =================
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+from email_alert import send_email
 
 # ================= PAGE CONFIG =================
 st.set_page_config(
     page_title="Driver Drowsiness Alert System",
     page_icon="🚗",
-    layout="wide"
+    layout="centered"
 )
 
+# ================= UI CSS =================
+st.markdown("""
+<style>
+
+.stApp {
+    background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+}
+
+.main-title {
+    font-size: 38px;
+    font-weight: 900;
+    text-align: center;
+    background: linear-gradient(90deg, #ff4b4b, #ff9068);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.sub-title {
+    text-align: center;
+    color: #cfd8dc;
+    margin-bottom: 20px;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #ff4b4b, #ff6f61);
+    border: none;
+    border-radius: 12px;
+    height: 52px;
+    font-size: 18px;
+    font-weight: 600;
+    color: white;
+    transition: 0.3s ease;
+}
+
+.stButton > button:hover {
+    transform: scale(1.05);
+    box-shadow: 0 0 20px rgba(255,75,75,0.6);
+}
+
+[data-testid="stImage"] img {
+    border-radius: 18px;
+    border: 2px solid rgba(255,255,255,0.15);
+    box-shadow: 0 0 40px rgba(0,0,0,0.7);
+    animation: fadeIn 0.4s ease-in-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+</style>
+""", unsafe_allow_html=True)
+
 # ================= HEADER =================
-st.markdown("## 🚗 Driver Drowsiness Alert System")
-st.markdown("Real-time eye-based drowsiness detection using **MediaPipe & OpenCV**")
+st.markdown('<div class="main-title">🚗 Driver Drowsiness Alert System</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Real-time AI Driver Monitoring (MediaPipe + YOLO)</div>', unsafe_allow_html=True)
+
+# ================= SESSION STATE =================
+if "run" not in st.session_state:
+    st.session_state.run = False
+if "cap" not in st.session_state:
+    st.session_state.cap = None
+if "last_email" not in st.session_state:
+    st.session_state.last_email = 0
+if "last_beep" not in st.session_state:
+    st.session_state.last_beep = 0
+
+# ================= CONTROLS =================
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("▶ Start Camera", use_container_width=True):
+        if not st.session_state.run:
+            st.session_state.run = True
+            st.session_state.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
+with col2:
+    if st.button("⏹ Stop Camera", use_container_width=True):
+        st.session_state.run = False
+        if st.session_state.cap:
+            st.session_state.cap.release()
+            st.session_state.cap = None
+
 st.markdown("---")
 
-# ================= SIDEBAR =================
-st.sidebar.header("⚙️ Controls")
-start = st.sidebar.toggle("▶ Start Detection")
+frame_box = st.empty()
 
-EAR_THRESHOLD = st.sidebar.slider("EAR Threshold", 0.15, 0.35, 0.25, 0.01)
-CLOSED_TIME_THRESHOLD = st.sidebar.slider("Alert Time (seconds)", 1.0, 5.0, 2.0, 0.5)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("👨‍💻 **Project by Prakhar Deshmukh**")
-
-# ================= METRICS =================
-col1, col2, col3 = st.columns(3)
-eye_box = col1.metric("👁 Eye Status", "Idle")
-time_box = col2.metric("⏱ Closed Time", "0.0 s")
-alert_box = col3.metric("🚨 Alert", "OFF")
-
-frame_window = st.image([])
-
-# ================= MEDIAPIPE SETUP =================
+# ================= MODELS =================
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1)
 
@@ -49,71 +124,80 @@ def eye_aspect_ratio(eye):
     C = np.linalg.norm(eye[0] - eye[3])
     return (A + B) / (2.0 * C)
 
-# ================= ALARM =================
-alarm_active = False
+yolo = YOLO("yolov8n.pt")
 
-def beep_alarm():
-    while alarm_active:
-        winsound.Beep(1000, 400)
-        time.sleep(0.1)
+EAR_THRESHOLD = 0.25
+EMAIL_COOLDOWN = 60
+BEEP_COOLDOWN = 2  # seconds
 
-eye_closed_start = None
+# ================= BEEP FUNCTION =================
+def play_beep():
+    winsound.Beep(1200, 600)  # frequency, duration
 
-# ================= MAIN LOOP =================
-if start:
-    cap = cv2.VideoCapture(0)
+# ================= CAMERA LOOP =================
+prev_time = time.time()
 
-    while start:
-        ret, frame = cap.read()
-        if not ret:
-            break
+while st.session_state.run:
 
+    ret, frame = st.session_state.cap.read()
+    if not ret:
+        st.error("❌ Camera not accessible")
+        break
+
+    alerts = []
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
+
+    if results.multi_face_landmarks:
+        face = results.multi_face_landmarks[0].landmark
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
 
-        status = "No Face"
-        closed_time = 0.0
+        left_eye = np.array([(face[i].x * w, face[i].y * h) for i in LEFT_EYE])
+        right_eye = np.array([(face[i].x * w, face[i].y * h) for i in RIGHT_EYE])
 
-        if results.multi_face_landmarks:
-            lm = results.multi_face_landmarks[0].landmark
+        ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2
+        if ear < EAR_THRESHOLD:
+            alerts.append("DROWSY")
 
-            left_eye = np.array([(lm[i].x * w, lm[i].y * h) for i in LEFT_EYE])
-            right_eye = np.array([(lm[i].x * w, lm[i].y * h) for i in RIGHT_EYE])
+    # ================= YOLO PHONE DETECTION =================
+    yolo_results = yolo(frame, conf=0.5, verbose=False)
+    for r in yolo_results:
+        for box in r.boxes:
+            label = yolo.names[int(box.cls[0])]
+            if label == "cell phone":
+                alerts.append("PHONE")
 
-            ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
+    # ================= EMAIL ALERT =================
+    if alerts and time.time() - st.session_state.last_email > EMAIL_COOLDOWN:
+        send_email("🚨 ALERT: " + ", ".join(set(alerts)))
+        st.session_state.last_email = time.time()
 
-            if ear < EAR_THRESHOLD:
-                if eye_closed_start is None:
-                    eye_closed_start = time.time()
+    # ================= BEEP ALERT =================
+    if alerts and time.time() - st.session_state.last_beep > BEEP_COOLDOWN:
+        threading.Thread(target=play_beep, daemon=True).start()
+        st.session_state.last_beep = time.time()
 
-                closed_time = time.time() - eye_closed_start
-                status = f"DROWSY ({closed_time:.1f}s)"
+    # ================= VISUAL ALERT =================
+    if alerts:
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], frame.shape[0]), (0, 0, 255), 6)
+        alert_text = " / ".join(set(alerts))
+        cv2.rectangle(frame, (10, 10), (360, 60), (255, 75, 75), -1)
+        cv2.putText(frame, alert_text, (20, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-                eye_box.metric("👁 Eye Status", "Closed")
-                time_box.metric("⏱ Closed Time", f"{closed_time:.1f} s")
+    # ================= FPS =================
+    curr_time = time.time()
+    fps = int(1 / (curr_time - prev_time))
+    prev_time = curr_time
+    cv2.putText(frame, f"FPS: {fps}", (frame.shape[1]-140, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
-                if closed_time >= CLOSED_TIME_THRESHOLD:
-                    alert_box.metric("🚨 Alert", "ON")
-                    if not alarm_active:
-                        alarm_active = True
-                        threading.Thread(target=beep_alarm, daemon=True).start()
-                else:
-                    alert_box.metric("🚨 Alert", "OFF")
+    # ================= DISPLAY =================
+    frame_box.image(frame, channels="BGR", use_container_width=True)
+    time.sleep(0.03)
 
-            else:
-                eye_closed_start = None
-                alarm_active = False
-                status = "Eyes Open"
-
-                eye_box.metric("👁 Eye Status", "Open")
-                time_box.metric("⏱ Closed Time", "0.0 s")
-                alert_box.metric("🚨 Alert", "OFF")
-
-            color = (0, 255, 0) if status == "Eyes Open" else (0, 0, 255)
-            cv2.putText(frame, status, (30, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-        frame_window.image(frame, channels="BGR")
-
-    cap.release()
+# ================= CLEANUP =================
+if st.session_state.cap:
+    st.session_state.cap.release()
+    st.session_state.cap = None

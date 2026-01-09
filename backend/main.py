@@ -1,23 +1,53 @@
+# ================= STANDARD IMPORTS =================
+import sys
+import os
+import time
+import threading
+import winsound
+
+# ================= ADD PROJECT ROOT FIRST =================
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+# ================= PROJECT IMPORTS =================
+from email_alert import send_email
+
+# ================= ENV + TWILIO =================
+from dotenv import load_dotenv
+from twilio.rest import Client
+
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
+
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_AUTH = os.getenv("TWILIO_AUTH")
+TWILIO_PHONE = os.getenv("TWILIO_PHONE")
+ALERT_PHONE = os.getenv("ALERT_PHONE")
+
+print("Twilio SID Loaded:", bool(TWILIO_SID))
+print("Twilio Token Loaded:", bool(TWILIO_AUTH))
+print("Sender Number:", TWILIO_PHONE)
+print("Receiver Number:", ALERT_PHONE)
+
+client = Client(TWILIO_SID, TWILIO_AUTH)
+
+# ================= CV / ML =================
 import cv2
 import mediapipe as mp
 import numpy as np
-import time
-import winsound
-import threading
 from ultralytics import YOLO
-import os
 
-# ================= YOLO MODEL LOADING =================
-CUSTOM_MODEL_PATH = "models/yolo_driver.pt"
+# ================= YOLO MODEL =================
+CUSTOM_MODEL_PATH = os.path.join("models", "yolo_driver.pt")
 
 if os.path.exists(CUSTOM_MODEL_PATH) and os.path.getsize(CUSTOM_MODEL_PATH) > 1_000_000:
     print("✅ Using custom YOLO model")
     yolo = YOLO(CUSTOM_MODEL_PATH)
 else:
-    print("⚠️ Custom YOLO model not found. Using pretrained yolov8n.")
-    yolo = YOLO("yolov8n.pt")  # auto-download
+    print("⚠️ Using pretrained YOLOv8")
+    yolo = YOLO("yolov8n.pt")
 
-# ================= MediaPipe Face Mesh =================
+# ================= MEDIAPIPE =================
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
@@ -26,17 +56,23 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-# ================= Eye Landmarks =================
+# ================= LANDMARK INDICES =================
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MOUTH = [13, 14, 78, 308]
+NOSE = 1
 
+# ================= CALCULATIONS =================
 def eye_aspect_ratio(eye):
     A = np.linalg.norm(eye[1] - eye[5])
     B = np.linalg.norm(eye[2] - eye[4])
     C = np.linalg.norm(eye[0] - eye[3])
     return (A + B) / (2.0 * C)
 
-# ================= Alarm =================
+def mouth_aspect_ratio(mouth):
+    return np.linalg.norm(mouth[0] - mouth[1]) / np.linalg.norm(mouth[2] - mouth[3])
+
+# ================= ALARM =================
 alarm_active = False
 
 def beep_alarm():
@@ -44,11 +80,25 @@ def beep_alarm():
         winsound.Beep(1000, 400)
         time.sleep(0.1)
 
-# ================= Thresholds =================
+# ================= THRESHOLDS =================
 EAR_THRESHOLD = 0.25
-CLOSED_TIME_THRESHOLD = 2.0
-eye_closed_start = None
+EYE_TIME = 2.0
+MAR_THRESHOLD = 0.6
+YAWN_TIME = 2.0
+LOOK_TIME = 3.0
+EMAIL_COOLDOWN = 60
+SMS_COOLDOWN = 120
 
+# ================= STATE =================
+eye_closed_start = None
+yawn_start = None
+look_start = None
+nose_center = None
+last_email_time = 0
+last_sms_time = 0
+sms_sent = False
+
+# ================= CAMERA =================
 cap = cv2.VideoCapture(0)
 
 while True:
@@ -59,67 +109,92 @@ while True:
     h, w = frame.shape[:2]
     alerts = []
 
-    # ================= FACE & EYE DETECTION =================
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(rgb)
 
     if results.multi_face_landmarks:
         face = results.multi_face_landmarks[0].landmark
 
-        # Face bounding box
+        # -------- FACE BOX --------
         xs = [int(lm.x * w) for lm in face]
         ys = [int(lm.y * h) for lm in face]
-        x_min, x_max = min(xs), max(xs)
-        y_min, y_max = min(ys), max(ys)
-        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
+        cv2.rectangle(frame, (min(xs), min(ys)), (max(xs), max(ys)), (255, 0, 0), 2)
 
-        # Eye landmarks
+        # -------- EYE DROWSINESS --------
         left_eye = np.array([(face[i].x * w, face[i].y * h) for i in LEFT_EYE])
         right_eye = np.array([(face[i].x * w, face[i].y * h) for i in RIGHT_EYE])
-
-        for (x, y) in np.concatenate((left_eye, right_eye)):
-            cv2.circle(frame, (int(x), int(y)), 2, (0, 255, 0), -1)
 
         ear = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2
 
         if ear < EAR_THRESHOLD:
             if eye_closed_start is None:
                 eye_closed_start = time.time()
-            elif time.time() - eye_closed_start > CLOSED_TIME_THRESHOLD:
+            elif time.time() - eye_closed_start > EYE_TIME:
                 alerts.append("DROWSY")
+
                 if not alarm_active:
                     alarm_active = True
                     threading.Thread(target=beep_alarm, daemon=True).start()
+
+                if not sms_sent and time.time() - last_sms_time > SMS_COOLDOWN:
+                    client.messages.create(
+                        body="⚠ ALERT: Drowsiness detected. Please take a break.",
+                        from_=TWILIO_PHONE,
+                        to=ALERT_PHONE
+                    )
+                    sms_sent = True
+                    last_sms_time = time.time()
         else:
             eye_closed_start = None
             alarm_active = False
+            sms_sent = False
 
-    # ================= YOLO DETECTION =================
-    yolo_results = yolo(frame, conf=0.5, verbose=False)
+        # -------- YAWNING --------
+        mouth = np.array([(face[i].x * w, face[i].y * h) for i in MOUTH])
+        if mouth_aspect_ratio(mouth) > MAR_THRESHOLD:
+            if yawn_start is None:
+                yawn_start = time.time()
+            elif time.time() - yawn_start > YAWN_TIME:
+                alerts.append("YAWNING")
+        else:
+            yawn_start = None
 
-    for r in yolo_results:
+        # -------- LOOKING AWAY --------
+        nose_x = face[NOSE].x * w
+        if nose_center is None:
+            nose_center = nose_x
+
+        if abs(nose_x - nose_center) > 40:
+            if look_start is None:
+                look_start = time.time()
+            elif time.time() - look_start > LOOK_TIME:
+                alerts.append("DISTRACTED")
+        else:
+            look_start = None
+
+    # -------- PHONE DETECTION --------
+    detections = yolo(frame, conf=0.5, verbose=False)
+    for r in detections:
         for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
             label = yolo.names[int(box.cls[0])]
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(frame, label, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
             if label == "cell phone":
                 alerts.append("PHONE")
 
-    # ================= ALERT TEXT =================
-    y_offset = 30
-    for text in set(alerts):
-        cv2.putText(frame, text, (10, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-        y_offset += 30
+    # -------- EMAIL ALERT --------
+    if alerts and time.time() - last_email_time > EMAIL_COOLDOWN:
+        send_email("🚨 ALERT: " + ", ".join(set(alerts)))
+        last_email_time = time.time()
 
-    cv2.imshow("Driver Monitoring System", frame)
+    # -------- DISPLAY --------
+    y = 30
+    for a in set(alerts):
+        cv2.putText(frame, a, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        y += 30
+
+    cv2.imshow("Driver Drowsiness Alert System", frame)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
-        alarm_active = False
         break
 
 cap.release()
